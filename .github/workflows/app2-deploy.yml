@@ -209,7 +209,7 @@ jobs:
           RID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" \
             --strategy Rolling \
-            --preferences '{"MinHealthyPercentage":50,"InstanceWarmup":120,"AutoRollback":true}' \
+            --preferences '{"MinHealthyPercentage":50,"InstanceWarmup":120}' \
             --query "InstanceRefreshId" --output text)
           echo "refresh_id=$RID" >> "$GITHUB_OUTPUT"
           echo "🔄 Refresh: $RID"
