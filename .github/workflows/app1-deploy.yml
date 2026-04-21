@@ -6,7 +6,7 @@ name: "App1 Products — Deploy"
 
 on:
   push:
-    branches: [ main ]
+    branches: [ master ]
     paths:
       - "apps/app1-products/**"
       - ".github/workflows/app1-deploy.yml"
@@ -314,21 +314,16 @@ jobs:
               --actions "Type=forward,TargetGroupArn=${{ steps.infra.outputs.tg_app2_blue }}" 2>/dev/null || true
           fi
 
-          # Scale down GREEN
-          aws autoscaling cancel-instance-refresh \
-            --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" 2>/dev/null || true
-          aws autoscaling update-auto-scaling-group \
-            --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" \
-            --min-size 0 --desired-capacity 0 2>/dev/null || true
-
           # Scale BLUE back up
           aws autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "${{ steps.infra.outputs.asg_blue }}" \
             --min-size 1 --desired-capacity 1 --max-size 4 2>/dev/null || true
 
-          # Scale GREEN to 0
+          # Scale down GREEN to 0
+          aws autoscaling cancel-instance-refresh \
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" 2>/dev/null || true
           aws autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" \
-            --min-size 0 2>/dev/null || true
+            --min-size 0 --desired-capacity 0 2>/dev/null || true
 
           echo "✅ Auto-rollback complete — traffic on BLUE"
