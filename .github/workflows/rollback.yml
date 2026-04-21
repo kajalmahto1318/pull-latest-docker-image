@@ -1,0 +1,113 @@
+﻿# ─────────────────────────────────────────────────────────────────────────────
+# Rollback — One-click: ALB → BLUE + SSM restore + GREEN down
+#
+# Trigger: GitHub Actions UI → "Run workflow" (one click, then 100% automatic)
+# ─────────────────────────────────────────────────────────────────────────────
+name: "Rollback to BLUE"
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Reason for rollback"
+        required: true
+
+concurrency:
+  group: green-deployment
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+jobs:
+  rollback:
+    name: "Auto Rollback → BLUE"
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: "Audit log"
+        run: |
+          echo "🔔 ROLLBACK TRIGGERED"
+          echo "   By:     ${{ github.actor }}"
+          echo "   Reason: ${{ inputs.reason }}"
+          echo "   Time:   $(date -u)"
+
+      - name: "Switch ALB → BLUE"
+        run: |
+          echo "🔄 Switching ALB traffic to BLUE..."
+          aws elbv2 modify-listener --listener-arn "${{ secrets.ALB_LISTENER_ARN }}" \
+            --default-actions "Type=forward,TargetGroupArn=${{ secrets.TG_APP1_BLUE }}"
+          RULE_ARN=$(aws elbv2 describe-rules --listener-arn "${{ secrets.ALB_LISTENER_ARN }}" \
+            --query "Rules[?Priority=='100'].RuleArn" --output text)
+          if [ -n "$RULE_ARN" ] && [ "$RULE_ARN" != "None" ]; then
+            aws elbv2 modify-rule --rule-arn "$RULE_ARN" \
+              --actions "Type=forward,TargetGroupArn=${{ secrets.TG_APP2_BLUE }}"
+          fi
+          echo "✅ Traffic now on BLUE"
+
+      - name: "Scale up BLUE"
+        run: |
+          DESIRED=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "${{ secrets.ASG_NAME_GREEN }}" \
+            --query "AutoScalingGroups[0].DesiredCapacity" --output text 2>/dev/null || echo "2")
+          [ "$DESIRED" -lt 2 ] && DESIRED=2
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME_BLUE }}" \
+            --min-size 1 --desired-capacity "$DESIRED" --max-size 4
+          echo "✅ BLUE scaled to $DESIRED"
+
+      - name: "Restore SSM parameters"
+        run: |
+          for APP in app1 app2; do
+            PREV=$(aws ssm get-parameter --name "/apps/${APP}/image_tag_previous" \
+              --query "Parameter.Value" --output text 2>/dev/null || echo "")
+            if [ -n "$PREV" ] && [ "$PREV" != "None" ]; then
+              aws ssm put-parameter --name "/apps/${APP}/image_tag" \
+                --value "$PREV" --type String --overwrite
+              echo "  ✅ /apps/${APP}/image_tag → $PREV"
+            fi
+          done
+          PREV_MANIFEST=$(aws ssm get-parameter --name "/apps/releases/current_previous" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          if [ -n "$PREV_MANIFEST" ] && [ "$PREV_MANIFEST" != "None" ]; then
+            aws ssm put-parameter --name "/apps/releases/current" \
+              --value "$PREV_MANIFEST" --type String --overwrite
+            echo "  ✅ Release manifest restored"
+          fi
+
+      - name: "Scale down GREEN"
+        run: |
+          aws autoscaling cancel-instance-refresh \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" 2>/dev/null || true
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" \
+            --min-size 0 --desired-capacity 0
+          echo "✅ GREEN scaled to 0"
+
+      - name: "Refresh BLUE instances"
+        run: |
+          aws autoscaling cancel-instance-refresh \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME_BLUE }}" 2>/dev/null || true
+          sleep 5
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME_BLUE }}" \
+            --strategy Rolling \
+            --preferences '{"MinHealthyPercentage":50,"InstanceWarmup":120}' || true
+          echo "✅ BLUE refresh started"
+
+      - name: "Rollback complete"
+        run: |
+          echo "═══════════════════════════════════════"
+          echo "  ✅ ROLLBACK COMPLETE (automatic)"
+          echo "  Traffic:  BLUE (live)"
+          echo "  GREEN:    scaled to 0"
+          echo "  SSM:      restored to previous"
+          echo "  BLUE:     refreshing with good tags"
+          echo "  Reason:   ${{ inputs.reason }}"
+          echo "═══════════════════════════════════════"

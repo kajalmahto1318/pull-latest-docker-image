@@ -1,0 +1,276 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# App2 Orders — Build, Push, Deploy to GREEN
+# ─────────────────────────────────────────────────────────────────────────────
+name: "App2 Orders — Deploy"
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "apps/app2-orders/**"
+      - ".github/workflows/app2-deploy.yml"
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPO: app2-orders
+  APP_NAME: app2
+  SSM_TAG: /apps/app2/image_tag
+  SSM_RELEASE: /apps/releases/current
+  APP_PORT: 5002
+
+jobs:
+  # ═══ JOB 1: TEST ═══════════════════════════════════════════════════════════
+  test:
+    name: "Test"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/app2-orders
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pytest
+      - run: pytest tests/ -v
+
+  # ═══ JOB 2: BUILD & PUSH ═══════════════════════════════════════════════════
+  build:
+    name: "Build & Push"
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - id: tag
+        run: |
+          TAG="git-${GITHUB_SHA::12}"
+          echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: apps/app2-orders
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.tag.outputs.image_tag }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest
+          build-args: APP_VERSION=${{ steps.tag.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - run: |
+          echo "✅ Pushed ${{ env.ECR_REPO }}:${{ steps.tag.outputs.image_tag }}"
+
+  # ═══ JOB 3: DEPLOY TO GREEN ═══════════════════════════════════════════════
+  deploy:
+    name: "Deploy to GREEN"
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    # ─── Only ONE deploy job runs at a time across ALL apps ───
+    # Other app deploys QUEUE here (cancel-in-progress: false = wait, don't kill)
+    concurrency:
+      group: green-deployment
+      cancel-in-progress: false
+
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Queue status: show if we were waiting ──
+      - name: "Deploy queue status"
+        run: |
+          echo "═══════════════════════════════════════"
+          echo "  🔒 DEPLOY LOCK ACQUIRED"
+          echo "  App:  ${{ env.APP_NAME }}"
+          echo "  Tag:  ${{ needs.build.outputs.image_tag }}"
+          echo "═══════════════════════════════════════"
+
+          # Check if GREEN ASG has an active refresh (means we were queued behind someone)
+          ACTIVE=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" \
+            --query "InstanceRefreshes[?Status=='InProgress'].InstanceRefreshId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$ACTIVE" ] && [ "$ACTIVE" != "None" ]; then
+            echo "⏳ NOTE: GREEN refresh still active ($ACTIVE)"
+            echo "   This means another deploy may have just finished."
+            echo "   Waiting for it to complete before we proceed..."
+            for i in $(seq 1 15); do
+              STATUS=$(aws autoscaling describe-instance-refreshes \
+                --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" \
+                --instance-refresh-ids "$ACTIVE" \
+                --query "InstanceRefreshes[0].Status" --output text 2>/dev/null || echo "")
+              echo "   [$i/15] Refresh $ACTIVE: $STATUS"
+              [ "$STATUS" = "Successful" ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] && break
+              sleep 10
+            done
+          else
+            echo "✅ No other deploy running — proceeding immediately"
+          fi
+
+      - name: "Backup current state"
+        id: backup
+        run: |
+          PREV=$(aws ssm get-parameter --name "${{ env.SSM_TAG }}" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "latest")
+          echo "prev_tag=$PREV" >> "$GITHUB_OUTPUT"
+          aws ssm put-parameter --name "${{ env.SSM_TAG }}_previous" \
+            --value "$PREV" --type String --overwrite
+
+          MANIFEST=$(aws ssm get-parameter --name "${{ env.SSM_RELEASE }}" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo '{}')
+          aws ssm put-parameter --name "${{ env.SSM_RELEASE }}_previous" \
+            --value "$MANIFEST" --type String --overwrite
+
+      - name: "Update SSM image tag"
+        run: |
+          aws ssm put-parameter --name "${{ env.SSM_TAG }}" \
+            --value "${{ needs.build.outputs.image_tag }}" --type String --overwrite
+
+      - name: "Update release manifest"
+        run: |
+          CURRENT=$(aws ssm get-parameter --name "${{ env.SSM_RELEASE }}" \
+            --query "Parameter.Value" --output text 2>/dev/null \
+            || echo '{"release_id":"unknown","services":{}}')
+
+          NEW=$(echo "$CURRENT" | jq -c \
+            --arg tag "${{ needs.build.outputs.image_tag }}" \
+            --arg rid "rel-${{ github.run_id }}" \
+            '.release_id = $rid | .services.${{ env.APP_NAME }} = $tag')
+
+          aws ssm put-parameter --name "${{ env.SSM_RELEASE }}" \
+            --value "$NEW" --type String --overwrite
+          echo "✅ Manifest: $NEW"
+
+      - name: "Scale up GREEN"
+        run: |
+          DESIRED=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "${{ secrets.ASG_NAME_BLUE }}" \
+            --query "AutoScalingGroups[0].DesiredCapacity" --output text)
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" \
+            --min-size 1 --desired-capacity "$DESIRED" --max-size 4
+
+      - name: "Trigger GREEN refresh"
+        id: refresh
+        run: |
+          aws autoscaling cancel-instance-refresh \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" 2>/dev/null || true
+          sleep 5
+
+          RID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" \
+            --strategy Rolling \
+            --preferences '{"MinHealthyPercentage":50,"InstanceWarmup":120,"AutoRollback":true}' \
+            --query "InstanceRefreshId" --output text)
+          echo "refresh_id=$RID" >> "$GITHUB_OUTPUT"
+          echo "🔄 Refresh: $RID"
+
+      - name: "Wait for healthy GREEN"
+        run: |
+          RID="${{ steps.refresh.outputs.refresh_id }}"
+          ASG="${{ secrets.ASG_NAME_GREEN }}"
+          for i in $(seq 1 30); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG" --instance-refresh-ids "$RID" \
+              --query "InstanceRefreshes[0].Status" --output text 2>/dev/null || echo "Pending")
+            PCT=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG" --instance-refresh-ids "$RID" \
+              --query "InstanceRefreshes[0].PercentageComplete" --output text 2>/dev/null || echo "0")
+            echo "  [$i/30] Status: $STATUS | Progress: $PCT%"
+            [ "$STATUS" = "Successful" ] && echo "✅ GREEN healthy!" && exit 0
+            [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] && echo "❌ Failed!" && exit 1
+            sleep 20
+          done
+          echo "⏰ Timeout" && exit 1
+
+      # ── AUTO: Switch ALB traffic BLUE → GREEN ──
+      - name: "Switch traffic to GREEN"
+        run: |
+          echo "🔄 Switching ALB traffic to GREEN..."
+
+          aws elbv2 modify-listener --listener-arn "${{ secrets.ALB_LISTENER_ARN }}" \
+            --default-actions "Type=forward,TargetGroupArn=${{ secrets.TG_APP1_GREEN }}"
+
+          RULE_ARN=$(aws elbv2 describe-rules --listener-arn "${{ secrets.ALB_LISTENER_ARN }}" \
+            --query "Rules[?Priority=='100'].RuleArn" --output text)
+          if [ -n "$RULE_ARN" ] && [ "$RULE_ARN" != "None" ]; then
+            aws elbv2 modify-rule --rule-arn "$RULE_ARN" \
+              --actions "Type=forward,TargetGroupArn=${{ secrets.TG_APP2_GREEN }}"
+          fi
+          echo "✅ Traffic now on GREEN"
+
+      - name: "Scale down BLUE to standby"
+        run: |
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME_BLUE }}" \
+            --min-size 1 --desired-capacity 1
+          echo "✅ BLUE kept at 1 instance (rollback ready)"
+
+      - name: "Deploy complete"
+        if: success()
+        run: |
+          echo "═══════════════════════════════════════"
+          echo "  ✅ FULLY AUTOMATIC DEPLOY COMPLETE"
+          echo "  App:     ${{ env.APP_NAME }}"
+          echo "  Tag:     ${{ needs.build.outputs.image_tag }}"
+          echo "  Traffic: GREEN (live)"
+          echo "  BLUE:    standby (rollback ready)"
+          echo "═══════════════════════════════════════"
+
+      - name: "Rollback on failure"
+        if: failure()
+        run: |
+          echo "❌ Deploy failed — auto-rolling back..."
+
+          # Restore SSM tags
+          aws ssm put-parameter --name "${{ env.SSM_TAG }}" \
+            --value "${{ steps.backup.outputs.prev_tag }}" --type String --overwrite
+          PREV_MANIFEST=$(aws ssm get-parameter --name "${{ env.SSM_RELEASE }}_previous" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          if [ -n "$PREV_MANIFEST" ] && [ "$PREV_MANIFEST" != "None" ]; then
+            aws ssm put-parameter --name "${{ env.SSM_RELEASE }}" \
+              --value "$PREV_MANIFEST" --type String --overwrite
+          fi
+
+          # Switch ALB back to BLUE
+          aws elbv2 modify-listener --listener-arn "${{ secrets.ALB_LISTENER_ARN }}" \
+            --default-actions "Type=forward,TargetGroupArn=${{ secrets.TG_APP1_BLUE }}" 2>/dev/null || true
+          RULE_ARN=$(aws elbv2 describe-rules --listener-arn "${{ secrets.ALB_LISTENER_ARN }}" \
+            --query "Rules[?Priority=='100'].RuleArn" --output text 2>/dev/null || echo "")
+          if [ -n "$RULE_ARN" ] && [ "$RULE_ARN" != "None" ]; then
+            aws elbv2 modify-rule --rule-arn "$RULE_ARN" \
+              --actions "Type=forward,TargetGroupArn=${{ secrets.TG_APP2_BLUE }}" 2>/dev/null || true
+          fi
+
+          # Scale down GREEN
+          aws autoscaling cancel-instance-refresh \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" 2>/dev/null || true
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" \
+            --min-size 0 --desired-capacity 0 2>/dev/null || true
+
+          # Scale BLUE back up
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME_BLUE }}" \
+            --min-size 1 --desired-capacity 2 --max-size 4 2>/dev/null || true
+
+          echo "✅ Auto-rollback complete — traffic on BLUE"
