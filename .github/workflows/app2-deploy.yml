@@ -247,12 +247,17 @@ jobs:
           fi
           echo "✅ Traffic now on GREEN"
 
-      - name: "Scale down BLUE to standby"
+      - name: "Lock GREEN and shut down BLUE"
         run: |
           aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" \
+            --min-size 1
+          echo "✅ GREEN: min=1 (auto-scale: 1→4 based on CPU)"
+
+          aws autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "${{ steps.infra.outputs.asg_blue }}" \
-            --min-size 1 --desired-capacity 1
-          echo "✅ BLUE kept at 1 instance (rollback ready)"
+            --min-size 0 --desired-capacity 0
+          echo "✅ BLUE: 0 instances (zero cost)"
 
       - name: "Deploy complete"
         if: success()
@@ -261,8 +266,8 @@ jobs:
           echo "  ✅ FULLY AUTOMATIC DEPLOY COMPLETE"
           echo "  App:     ${{ env.APP_NAME }}"
           echo "  Tag:     ${{ needs.build.outputs.image_tag }}"
-          echo "  Traffic: GREEN (live)"
-          echo "  BLUE:    standby (rollback ready)"
+          echo "  Traffic: GREEN (live, auto-scales 1→4)"
+          echo "  BLUE:    0 instances (zero cost)"
           echo "═══════════════════════════════════════"
 
       - name: "Rollback on failure"
@@ -299,5 +304,9 @@ jobs:
           aws autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "${{ steps.infra.outputs.asg_blue }}" \
             --min-size 1 --desired-capacity 1 --max-size 4 2>/dev/null || true
+
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" \
+            --min-size 0 2>/dev/null || true
 
           echo "✅ Auto-rollback complete — traffic on BLUE"

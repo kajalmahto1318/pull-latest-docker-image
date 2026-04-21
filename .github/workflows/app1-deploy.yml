@@ -260,13 +260,20 @@ jobs:
           fi
           echo "✅ Traffic now on GREEN"
 
-      # ── Scale down BLUE ──
-      - name: "Scale down BLUE to standby"
+      # ── Lock GREEN min=1 so auto-scale won't kill it ──
+      - name: "Lock GREEN and shut down BLUE"
         run: |
+          # GREEN is now serving traffic — set min=1 so it never goes to 0
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" \
+            --min-size 1
+          echo "✅ GREEN: min=1 (auto-scale: 1→4 based on CPU)"
+
+          # BLUE is no longer needed — scale to 0 (zero cost)
           aws autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "${{ steps.infra.outputs.asg_blue }}" \
-            --min-size 1 --desired-capacity 1
-          echo "✅ BLUE kept at 1 instance (rollback ready)"
+            --min-size 0 --desired-capacity 0
+          echo "✅ BLUE: 0 instances (zero cost)"
 
       - name: "Deploy complete"
         if: success()
@@ -275,8 +282,8 @@ jobs:
           echo "  ✅ FULLY AUTOMATIC DEPLOY COMPLETE"
           echo "  App:     ${{ env.APP_NAME }}"
           echo "  Tag:     ${{ needs.build.outputs.image_tag }}"
-          echo "  Traffic: GREEN (live)"
-          echo "  BLUE:    standby (rollback ready)"
+          echo "  Traffic: GREEN (live, auto-scales 1→4)"
+          echo "  BLUE:    0 instances (zero cost)"
           echo "═══════════════════════════════════════"
 
       # ── AUTO-ROLLBACK on failure ──
@@ -318,5 +325,10 @@ jobs:
           aws autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "${{ steps.infra.outputs.asg_blue }}" \
             --min-size 1 --desired-capacity 1 --max-size 4 2>/dev/null || true
+
+          # Scale GREEN to 0
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" \
+            --min-size 0 2>/dev/null || true
 
           echo "✅ Auto-rollback complete — traffic on BLUE"
