@@ -1,7 +1,6 @@
-﻿# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Rollback — One-click: ALB → BLUE + SSM restore + GREEN down
-#
-# Trigger: GitHub Actions UI → "Run workflow" (one click, then 100% automatic)
+# All infrastructure ARNs auto-discovered — only AWS keys needed in secrets
 # ─────────────────────────────────────────────────────────────────────────────
 name: "Rollback to BLUE"
 
@@ -17,7 +16,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_REGION: us-east-1
+  PROJECT: bluegreen
 
 jobs:
   rollback:
@@ -31,6 +31,27 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: "Discover infrastructure"
+        id: infra
+        run: |
+          echo "🔍 Auto-discovering infrastructure..."
+          ASG_BLUE="${{ env.PROJECT }}-asg-blue"
+          ASG_GREEN="${{ env.PROJECT }}-asg-green"
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names "${{ env.PROJECT }}-alb" \
+            --query "LoadBalancers[0].LoadBalancerArn" --output text)
+          LISTENER_ARN=$(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" \
+            --query "Listeners[0].ListenerArn" --output text)
+          TG_APP1_BLUE=$(aws elbv2 describe-target-groups --names "${{ env.PROJECT }}-app1-blue" \
+            --query "TargetGroups[0].TargetGroupArn" --output text)
+          TG_APP2_BLUE=$(aws elbv2 describe-target-groups --names "${{ env.PROJECT }}-app2-blue" \
+            --query "TargetGroups[0].TargetGroupArn" --output text)
+          echo "asg_blue=$ASG_BLUE" >> "$GITHUB_OUTPUT"
+          echo "asg_green=$ASG_GREEN" >> "$GITHUB_OUTPUT"
+          echo "listener_arn=$LISTENER_ARN" >> "$GITHUB_OUTPUT"
+          echo "tg_app1_blue=$TG_APP1_BLUE" >> "$GITHUB_OUTPUT"
+          echo "tg_app2_blue=$TG_APP2_BLUE" >> "$GITHUB_OUTPUT"
+          echo "✅ Infrastructure discovered"
+
       - name: "Audit log"
         run: |
           echo "🔔 ROLLBACK TRIGGERED"
@@ -41,24 +62,26 @@ jobs:
       - name: "Switch ALB → BLUE"
         run: |
           echo "🔄 Switching ALB traffic to BLUE..."
-          aws elbv2 modify-listener --listener-arn "${{ secrets.ALB_LISTENER_ARN }}" \
-            --default-actions "Type=forward,TargetGroupArn=${{ secrets.TG_APP1_BLUE }}"
-          RULE_ARN=$(aws elbv2 describe-rules --listener-arn "${{ secrets.ALB_LISTENER_ARN }}" \
+          aws elbv2 modify-listener \
+            --listener-arn "${{ steps.infra.outputs.listener_arn }}" \
+            --default-actions "Type=forward,TargetGroupArn=${{ steps.infra.outputs.tg_app1_blue }}"
+          RULE_ARN=$(aws elbv2 describe-rules \
+            --listener-arn "${{ steps.infra.outputs.listener_arn }}" \
             --query "Rules[?Priority=='100'].RuleArn" --output text)
           if [ -n "$RULE_ARN" ] && [ "$RULE_ARN" != "None" ]; then
             aws elbv2 modify-rule --rule-arn "$RULE_ARN" \
-              --actions "Type=forward,TargetGroupArn=${{ secrets.TG_APP2_BLUE }}"
+              --actions "Type=forward,TargetGroupArn=${{ steps.infra.outputs.tg_app2_blue }}"
           fi
           echo "✅ Traffic now on BLUE"
 
       - name: "Scale up BLUE"
         run: |
           DESIRED=$(aws autoscaling describe-auto-scaling-groups \
-            --auto-scaling-group-names "${{ secrets.ASG_NAME_GREEN }}" \
+            --auto-scaling-group-names "${{ steps.infra.outputs.asg_green }}" \
             --query "AutoScalingGroups[0].DesiredCapacity" --output text 2>/dev/null || echo "2")
           [ "$DESIRED" -lt 2 ] && DESIRED=2
           aws autoscaling update-auto-scaling-group \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME_BLUE }}" \
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_blue }}" \
             --min-size 1 --desired-capacity "$DESIRED" --max-size 4
           echo "✅ BLUE scaled to $DESIRED"
 
@@ -84,19 +107,19 @@ jobs:
       - name: "Scale down GREEN"
         run: |
           aws autoscaling cancel-instance-refresh \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" 2>/dev/null || true
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" 2>/dev/null || true
           aws autoscaling update-auto-scaling-group \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" \
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" \
             --min-size 0 --desired-capacity 0
           echo "✅ GREEN scaled to 0"
 
       - name: "Refresh BLUE instances"
         run: |
           aws autoscaling cancel-instance-refresh \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME_BLUE }}" 2>/dev/null || true
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_blue }}" 2>/dev/null || true
           sleep 5
           aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME_BLUE }}" \
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_blue }}" \
             --strategy Rolling \
             --preferences '{"MinHealthyPercentage":50,"InstanceWarmup":120}' || true
           echo "✅ BLUE refresh started"
@@ -104,10 +127,9 @@ jobs:
       - name: "Rollback complete"
         run: |
           echo "═══════════════════════════════════════"
-          echo "  ✅ ROLLBACK COMPLETE (automatic)"
+          echo "  ✅ ROLLBACK COMPLETE"
           echo "  Traffic:  BLUE (live)"
           echo "  GREEN:    scaled to 0"
           echo "  SSM:      restored to previous"
-          echo "  BLUE:     refreshing with good tags"
           echo "  Reason:   ${{ inputs.reason }}"
           echo "═══════════════════════════════════════"

@@ -1,5 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # App2 Orders — Build, Push, Deploy to GREEN
+# All infrastructure ARNs auto-discovered — only AWS keys needed in secrets
 # ─────────────────────────────────────────────────────────────────────────────
 name: "App2 Orders — Deploy"
 
@@ -12,12 +13,13 @@ on:
   workflow_dispatch:
 
 env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_REGION: us-east-1
   ECR_REPO: app2-orders
   APP_NAME: app2
   SSM_TAG: /apps/app2/image_tag
   SSM_RELEASE: /apps/releases/current
   APP_PORT: 5002
+  PROJECT: bluegreen
 
 jobs:
   # ═══ JOB 1: TEST ═══════════════════════════════════════════════════════════
@@ -72,8 +74,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - run: |
-          echo "✅ Pushed ${{ env.ECR_REPO }}:${{ steps.tag.outputs.image_tag }}"
+      - run: echo "✅ Pushed ${{ env.ECR_REPO }}:${{ steps.tag.outputs.image_tag }}"
 
   # ═══ JOB 3: DEPLOY TO GREEN ═══════════════════════════════════════════════
   deploy:
@@ -81,8 +82,6 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     environment: production
-    # ─── Only ONE deploy job runs at a time across ALL apps ───
-    # Other app deploys QUEUE here (cancel-in-progress: false = wait, don't kill)
     concurrency:
       group: green-deployment
       cancel-in-progress: false
@@ -94,7 +93,41 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # ── Queue status: show if we were waiting ──
+      # ── Auto-discover all infrastructure ARNs ──
+      - name: "Discover infrastructure"
+        id: infra
+        run: |
+          echo "🔍 Auto-discovering infrastructure..."
+
+          ASG_BLUE="${{ env.PROJECT }}-asg-blue"
+          ASG_GREEN="${{ env.PROJECT }}-asg-green"
+
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names "${{ env.PROJECT }}-alb" \
+            --query "LoadBalancers[0].LoadBalancerArn" --output text)
+
+          LISTENER_ARN=$(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" \
+            --query "Listeners[0].ListenerArn" --output text)
+
+          TG_APP1_BLUE=$(aws elbv2 describe-target-groups --names "${{ env.PROJECT }}-app1-blue" \
+            --query "TargetGroups[0].TargetGroupArn" --output text)
+          TG_APP1_GREEN=$(aws elbv2 describe-target-groups --names "${{ env.PROJECT }}-app1-green" \
+            --query "TargetGroups[0].TargetGroupArn" --output text)
+          TG_APP2_BLUE=$(aws elbv2 describe-target-groups --names "${{ env.PROJECT }}-app2-blue" \
+            --query "TargetGroups[0].TargetGroupArn" --output text)
+          TG_APP2_GREEN=$(aws elbv2 describe-target-groups --names "${{ env.PROJECT }}-app2-green" \
+            --query "TargetGroups[0].TargetGroupArn" --output text)
+
+          echo "asg_blue=$ASG_BLUE" >> "$GITHUB_OUTPUT"
+          echo "asg_green=$ASG_GREEN" >> "$GITHUB_OUTPUT"
+          echo "listener_arn=$LISTENER_ARN" >> "$GITHUB_OUTPUT"
+          echo "tg_app1_blue=$TG_APP1_BLUE" >> "$GITHUB_OUTPUT"
+          echo "tg_app1_green=$TG_APP1_GREEN" >> "$GITHUB_OUTPUT"
+          echo "tg_app2_blue=$TG_APP2_BLUE" >> "$GITHUB_OUTPUT"
+          echo "tg_app2_green=$TG_APP2_GREEN" >> "$GITHUB_OUTPUT"
+
+          echo "✅ All infrastructure discovered automatically"
+
+      # ── Queue status ──
       - name: "Deploy queue status"
         run: |
           echo "═══════════════════════════════════════"
@@ -103,22 +136,19 @@ jobs:
           echo "  Tag:  ${{ needs.build.outputs.image_tag }}"
           echo "═══════════════════════════════════════"
 
-          # Check if GREEN ASG has an active refresh (means we were queued behind someone)
           ACTIVE=$(aws autoscaling describe-instance-refreshes \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" \
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" \
             --query "InstanceRefreshes[?Status=='InProgress'].InstanceRefreshId" \
             --output text 2>/dev/null || echo "")
 
           if [ -n "$ACTIVE" ] && [ "$ACTIVE" != "None" ]; then
-            echo "⏳ NOTE: GREEN refresh still active ($ACTIVE)"
-            echo "   This means another deploy may have just finished."
-            echo "   Waiting for it to complete before we proceed..."
+            echo "⏳ Waiting for active refresh to finish..."
             for i in $(seq 1 15); do
               STATUS=$(aws autoscaling describe-instance-refreshes \
-                --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" \
+                --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" \
                 --instance-refresh-ids "$ACTIVE" \
                 --query "InstanceRefreshes[0].Status" --output text 2>/dev/null || echo "")
-              echo "   [$i/15] Refresh $ACTIVE: $STATUS"
+              echo "   [$i/15] Refresh: $STATUS"
               [ "$STATUS" = "Successful" ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] && break
               sleep 10
             done
@@ -139,23 +169,23 @@ jobs:
             --query "Parameter.Value" --output text 2>/dev/null || echo '{}')
           aws ssm put-parameter --name "${{ env.SSM_RELEASE }}_previous" \
             --value "$MANIFEST" --type String --overwrite
+          echo "📦 Backed up: tag=$PREV"
 
       - name: "Update SSM image tag"
         run: |
           aws ssm put-parameter --name "${{ env.SSM_TAG }}" \
             --value "${{ needs.build.outputs.image_tag }}" --type String --overwrite
+          echo "✅ SSM ${{ env.SSM_TAG }} = ${{ needs.build.outputs.image_tag }}"
 
       - name: "Update release manifest"
         run: |
           CURRENT=$(aws ssm get-parameter --name "${{ env.SSM_RELEASE }}" \
             --query "Parameter.Value" --output text 2>/dev/null \
             || echo '{"release_id":"unknown","services":{}}')
-
           NEW=$(echo "$CURRENT" | jq -c \
             --arg tag "${{ needs.build.outputs.image_tag }}" \
             --arg rid "rel-${{ github.run_id }}" \
             '.release_id = $rid | .services.${{ env.APP_NAME }} = $tag')
-
           aws ssm put-parameter --name "${{ env.SSM_RELEASE }}" \
             --value "$NEW" --type String --overwrite
           echo "✅ Manifest: $NEW"
@@ -163,21 +193,21 @@ jobs:
       - name: "Scale up GREEN"
         run: |
           DESIRED=$(aws autoscaling describe-auto-scaling-groups \
-            --auto-scaling-group-names "${{ secrets.ASG_NAME_BLUE }}" \
+            --auto-scaling-group-names "${{ steps.infra.outputs.asg_blue }}" \
             --query "AutoScalingGroups[0].DesiredCapacity" --output text)
+          echo "Matching BLUE capacity: $DESIRED"
           aws autoscaling update-auto-scaling-group \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" \
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" \
             --min-size 1 --desired-capacity "$DESIRED" --max-size 4
 
       - name: "Trigger GREEN refresh"
         id: refresh
         run: |
           aws autoscaling cancel-instance-refresh \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" 2>/dev/null || true
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" 2>/dev/null || true
           sleep 5
-
           RID=$(aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" \
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" \
             --strategy Rolling \
             --preferences '{"MinHealthyPercentage":50,"InstanceWarmup":120,"AutoRollback":true}' \
             --query "InstanceRefreshId" --output text)
@@ -187,13 +217,14 @@ jobs:
       - name: "Wait for healthy GREEN"
         run: |
           RID="${{ steps.refresh.outputs.refresh_id }}"
-          ASG="${{ secrets.ASG_NAME_GREEN }}"
           for i in $(seq 1 30); do
             STATUS=$(aws autoscaling describe-instance-refreshes \
-              --auto-scaling-group-name "$ASG" --instance-refresh-ids "$RID" \
+              --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" \
+              --instance-refresh-ids "$RID" \
               --query "InstanceRefreshes[0].Status" --output text 2>/dev/null || echo "Pending")
             PCT=$(aws autoscaling describe-instance-refreshes \
-              --auto-scaling-group-name "$ASG" --instance-refresh-ids "$RID" \
+              --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" \
+              --instance-refresh-ids "$RID" \
               --query "InstanceRefreshes[0].PercentageComplete" --output text 2>/dev/null || echo "0")
             echo "  [$i/30] Status: $STATUS | Progress: $PCT%"
             [ "$STATUS" = "Successful" ] && echo "✅ GREEN healthy!" && exit 0
@@ -202,26 +233,27 @@ jobs:
           done
           echo "⏰ Timeout" && exit 1
 
-      # ── AUTO: Switch ALB traffic BLUE → GREEN ──
       - name: "Switch traffic to GREEN"
         run: |
           echo "🔄 Switching ALB traffic to GREEN..."
 
-          aws elbv2 modify-listener --listener-arn "${{ secrets.ALB_LISTENER_ARN }}" \
-            --default-actions "Type=forward,TargetGroupArn=${{ secrets.TG_APP1_GREEN }}"
+          aws elbv2 modify-listener \
+            --listener-arn "${{ steps.infra.outputs.listener_arn }}" \
+            --default-actions "Type=forward,TargetGroupArn=${{ steps.infra.outputs.tg_app1_green }}"
 
-          RULE_ARN=$(aws elbv2 describe-rules --listener-arn "${{ secrets.ALB_LISTENER_ARN }}" \
+          RULE_ARN=$(aws elbv2 describe-rules \
+            --listener-arn "${{ steps.infra.outputs.listener_arn }}" \
             --query "Rules[?Priority=='100'].RuleArn" --output text)
           if [ -n "$RULE_ARN" ] && [ "$RULE_ARN" != "None" ]; then
             aws elbv2 modify-rule --rule-arn "$RULE_ARN" \
-              --actions "Type=forward,TargetGroupArn=${{ secrets.TG_APP2_GREEN }}"
+              --actions "Type=forward,TargetGroupArn=${{ steps.infra.outputs.tg_app2_green }}"
           fi
           echo "✅ Traffic now on GREEN"
 
       - name: "Scale down BLUE to standby"
         run: |
           aws autoscaling update-auto-scaling-group \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME_BLUE }}" \
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_blue }}" \
             --min-size 1 --desired-capacity 1
           echo "✅ BLUE kept at 1 instance (rollback ready)"
 
@@ -241,9 +273,8 @@ jobs:
         run: |
           echo "❌ Deploy failed — auto-rolling back..."
 
-          # Restore SSM tags
           aws ssm put-parameter --name "${{ env.SSM_TAG }}" \
-            --value "${{ steps.backup.outputs.prev_tag }}" --type String --overwrite
+            --value "${{ steps.backup.outputs.prev_tag }}" --type String --overwrite 2>/dev/null || true
           PREV_MANIFEST=$(aws ssm get-parameter --name "${{ env.SSM_RELEASE }}_previous" \
             --query "Parameter.Value" --output text 2>/dev/null || echo "")
           if [ -n "$PREV_MANIFEST" ] && [ "$PREV_MANIFEST" != "None" ]; then
@@ -251,26 +282,25 @@ jobs:
               --value "$PREV_MANIFEST" --type String --overwrite
           fi
 
-          # Switch ALB back to BLUE
-          aws elbv2 modify-listener --listener-arn "${{ secrets.ALB_LISTENER_ARN }}" \
-            --default-actions "Type=forward,TargetGroupArn=${{ secrets.TG_APP1_BLUE }}" 2>/dev/null || true
-          RULE_ARN=$(aws elbv2 describe-rules --listener-arn "${{ secrets.ALB_LISTENER_ARN }}" \
+          aws elbv2 modify-listener \
+            --listener-arn "${{ steps.infra.outputs.listener_arn }}" \
+            --default-actions "Type=forward,TargetGroupArn=${{ steps.infra.outputs.tg_app1_blue }}" 2>/dev/null || true
+          RULE_ARN=$(aws elbv2 describe-rules \
+            --listener-arn "${{ steps.infra.outputs.listener_arn }}" \
             --query "Rules[?Priority=='100'].RuleArn" --output text 2>/dev/null || echo "")
           if [ -n "$RULE_ARN" ] && [ "$RULE_ARN" != "None" ]; then
             aws elbv2 modify-rule --rule-arn "$RULE_ARN" \
-              --actions "Type=forward,TargetGroupArn=${{ secrets.TG_APP2_BLUE }}" 2>/dev/null || true
+              --actions "Type=forward,TargetGroupArn=${{ steps.infra.outputs.tg_app2_blue }}" 2>/dev/null || true
           fi
 
-          # Scale down GREEN
           aws autoscaling cancel-instance-refresh \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" 2>/dev/null || true
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" 2>/dev/null || true
           aws autoscaling update-auto-scaling-group \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME_GREEN }}" \
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_green }}" \
             --min-size 0 --desired-capacity 0 2>/dev/null || true
 
-          # Scale BLUE back up
           aws autoscaling update-auto-scaling-group \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME_BLUE }}" \
+            --auto-scaling-group-name "${{ steps.infra.outputs.asg_blue }}" \
             --min-size 1 --desired-capacity 2 --max-size 4 2>/dev/null || true
 
           echo "✅ Auto-rollback complete — traffic on BLUE"
